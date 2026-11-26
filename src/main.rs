@@ -248,6 +248,35 @@ fn poll_form() -> CreateModal {
     ])
 }
 
+/// Contents of the `/poll` triggered modal after being validated.
+struct PollInput {
+    question: String,
+    role: String,
+    closes_at: i64,
+    answers: Vec<Answer>,
+}
+
+/// Checks every field of the `/poll` form. `Err` is the message to show the creator.
+fn validate_form<Tz: TimeZone>(
+    form: &ModalInteraction,
+    now: DateTime<Tz>,
+) -> std::result::Result<PollInput, String> {
+    let question = field(form, "question");
+    if question.is_empty() {
+        return Err("The question can't be empty.".into());
+    }
+    let role = field(form, "role");
+    if role.is_empty() {
+        return Err("The role name can't be empty.".into());
+    }
+    Ok(PollInput {
+        question: question.into(),
+        role: role.into(),
+        closes_at: parse_close(field(form, "closes"), now)?,
+        answers: parse_answers(field(form, "yes"), field(form, "no"))?,
+    })
+}
+
 fn message(text: impl Into<String>) -> CreateInteractionResponseMessage {
     CreateInteractionResponseMessage::new().content(text)
 }
@@ -382,8 +411,6 @@ struct Handler {
 
 impl Handler {
     async fn start_poll(&self, ctx: &Context, form: &ModalInteraction) -> BoxResult<()> {
-        let question = field(form, "question").to_owned();
-        let role = field(form, "role").to_owned();
         let refuse = |text: String| {
             let msg = message(text).ephemeral(true);
             form.create_response(&ctx.http, CreateInteractionResponse::Message(msg))
@@ -391,22 +418,18 @@ impl Handler {
         let Some(guild) = form.guild_id else {
             return Ok(refuse("Polls only work in a server.".into()).await?);
         };
-        let closes_at = match parse_close(field(form, "closes"), Local::now()) {
-            Ok(t) => t,
-            Err(e) => return Ok(refuse(e).await?),
-        };
-        let answers = match parse_answers(field(form, "yes"), field(form, "no")) {
-            Ok(a) => a,
+        let input = match validate_form(form, Local::now()) {
+            Ok(input) => input,
             Err(e) => return Ok(refuse(e).await?),
         };
         let mut poll = Poll {
             message: 0, // known once posted
             channel: 0,
             guild: guild.get() as i64,
-            question,
-            role,
-            closes_at,
-            answers,
+            question: input.question,
+            role: input.role,
+            closes_at: input.closes_at,
+            answers: input.answers,
             votes: HashMap::new(),
             creator: form.user.id.get() as i64,
             role_id: None,
