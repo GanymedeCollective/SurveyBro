@@ -22,16 +22,16 @@ static POLL_EDITS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Poll {
     #[serde(rename = "_id")]
     message: i64,
-    channel: i64,
-    guild: i64,
+    channel: ChannelId,
+    guild: GuildId,
     question: String,
     role: String,
     closes_at: i64, // unix seconds
     answers: Vec<Answer>,
-    /// user id -> index into `answers`
-    votes: HashMap<String, i32>,
-    creator: i64,
-    role_id: Option<i64>,
+    /// voter -> index into `answers`
+    votes: HashMap<UserId, i32>,
+    creator: UserId,
+    role_id: Option<RoleId>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -187,7 +187,7 @@ fn parse_date<Tz: TimeZone>(input: &str, now: &DateTime<Tz>) -> std::result::Res
 }
 
 /// Link that jumps to a message in a server channel.
-fn message_link(guild: i64, channel: i64, message: i64) -> String {
+fn message_link(guild: GuildId, channel: ChannelId, message: i64) -> String {
     format!("{DISCORD_CHANNELS_URL}/{guild}/{channel}/{message}")
 }
 
@@ -286,7 +286,7 @@ fn message(text: impl Into<String>) -> CreateInteractionResponseMessage {
 async fn vote(
     polls: &Collection<Poll>,
     message: i64,
-    user: i64,
+    user: UserId,
     answer: i32,
 ) -> mongodb::error::Result<Option<String>> {
     let before = polls
@@ -302,7 +302,7 @@ async fn vote(
         .answers
         .get(answer as usize)
         .map_or("", |a| a.label.as_str());
-    Ok(Some(match poll.votes.get(&user.to_string()) {
+    Ok(Some(match poll.votes.get(&user) {
         Some(&prev) if prev == answer => format!("You already answered **{label}**."),
         Some(_) => format!("Changed your answer to **{label}**."),
         None => format!("You answered **{label}**."),
@@ -348,9 +348,9 @@ async fn close_poll(http: &Http, polls: &Collection<Poll>, id: i64) -> BoxResult
 
 async fn finish_close(http: &Http, polls: &Collection<Poll>, poll: &Poll) -> BoxResult<()> {
     let id = poll.message;
-    let guild = GuildId::new(poll.guild as u64);
+    let guild = poll.guild;
     let role = match poll.role_id {
-        Some(r) => RoleId::new(r as u64),
+        Some(r) => r,
         None => {
             let role = guild
                 .create_role(http, EditRole::new().name(&poll.role))
@@ -358,30 +358,27 @@ async fn finish_close(http: &Http, polls: &Collection<Poll>, poll: &Poll) -> Box
             polls
                 .update_one(
                     doc! { "_id": id },
-                    doc! { "$set": { "role_id": role.id.get() as i64 } },
+                    doc! { "$set": { "role_id": role.id.to_string() } },
                 )
                 .await?;
             role.id
         }
     };
     let mut given = 0;
-    for (user, &answer) in &poll.votes {
+    for (&user, &answer) in &poll.votes {
         if !poll.answers.get(answer as usize).is_some_and(|a| a.yes) {
             continue;
         }
-        let Ok(user) = user.parse::<u64>() else {
-            continue;
-        };
         given += 1;
         if let Err(e) = http
-            .add_member_role(guild, UserId::new(user), role, Some("survey-bro poll"))
+            .add_member_role(guild, user, role, Some("survey-bro poll"))
             .await
         {
             eprintln!("could not give role to {user}: {e}");
         }
     }
 
-    let channel = ChannelId::new(poll.channel as u64);
+    let channel = poll.channel;
     let message = MessageId::new(id as u64);
     let edit = EditMessage::new()
         .content(poll.text(Some(role)))
@@ -426,14 +423,14 @@ impl Handler {
         };
         let mut poll = Poll {
             message: 0, // known once posted
-            channel: 0,
-            guild: guild.get() as i64,
+            channel: form.channel_id,
+            guild,
             question: input.question,
             role: input.role,
             closes_at: input.closes_at,
             answers: input.answers,
             votes: HashMap::new(),
-            creator: form.user.id.get() as i64,
+            creator: form.user.id,
             role_id: None,
         };
         let post = message(poll.text(None)).components(buttons(&poll.answers, false));
@@ -441,7 +438,6 @@ impl Handler {
             .await?;
         let msg = form.get_response(&ctx.http).await?;
         poll.message = msg.id.get() as i64;
-        poll.channel = msg.channel_id.get() as i64;
         self.polls.insert_one(&poll).await?;
         schedule_close(
             ctx.http.clone(),
@@ -482,13 +478,7 @@ impl Handler {
     }
 
     async fn on_vote(&self, ctx: &Context, c: &ComponentInteraction, answer: i32) -> BoxResult<()> {
-        let result = vote(
-            &self.polls,
-            c.message.id.get() as i64,
-            c.user.id.get() as i64,
-            answer,
-        )
-        .await;
+        let result = vote(&self.polls, c.message.id.get() as i64, c.user.id, answer).await;
         let private =
             |text: &str| CreateInteractionResponse::Message(message(text).ephemeral(true));
         match result {
@@ -525,9 +515,7 @@ impl Handler {
         let poll = self.polls.find_one(doc! { "_id": id }).await?;
         let text = match poll {
             None => "This poll is already closed.",
-            Some(p) if p.creator != c.user.id.get() as i64 => {
-                "Only the poll's creator can close it."
-            }
+            Some(p) if p.creator != c.user.id => "Only the poll's creator can close it.",
             Some(_) => {
                 c.create_response(&ctx.http, update("Closing the poll..."))
                     .await?;
