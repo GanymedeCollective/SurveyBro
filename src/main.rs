@@ -13,6 +13,10 @@ type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sy
 
 const DISCORD_CHANNELS_URL: &str = "https://discord.com/channels";
 
+/// Held while editing a poll message, so edits land in order and each one is drawn
+/// from the latest votes.
+static POLL_EDITS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// One open poll.
 #[derive(Serialize, Deserialize)]
 struct Poll {
@@ -281,34 +285,32 @@ fn message(text: impl Into<String>) -> CreateInteractionResponseMessage {
     CreateInteractionResponseMessage::new().content(text)
 }
 
-/// Records (or changes) a user's answer. Returns the updated poll and a reply for the
-/// voter, or `None` if the poll is closed.
+/// Records (or changes) a user's answer. Returns the reply for the voter, or `None` if
+/// the poll is closed.
 async fn vote(
     polls: &Collection<Poll>,
     message: i64,
     user: i64,
     answer: i32,
-) -> mongodb::error::Result<Option<(Poll, String)>> {
+) -> mongodb::error::Result<Option<String>> {
     let before = polls
         .find_one_and_update(
             doc! { "_id": message, "closing": { "$ne": true } },
             doc! { "$set": { format!("votes.{user}"): answer } },
         )
         .await?;
-    let Some(mut poll) = before else {
+    let Some(poll) = before else {
         return Ok(None);
     };
     let label = poll
         .answers
         .get(answer as usize)
-        .map(|a| a.label.clone())
-        .unwrap_or_default();
-    let reply = match poll.votes.insert(user.to_string(), answer) {
-        Some(prev) if prev == answer => format!("You already answered **{label}**."),
+        .map_or("", |a| a.label.as_str());
+    Ok(Some(match poll.votes.get(&user.to_string()) {
+        Some(&prev) if prev == answer => format!("You already answered **{label}**."),
         Some(_) => format!("Changed your answer to **{label}**."),
         None => format!("You answered **{label}**."),
-    };
-    Ok(Some((poll, reply)))
+    }))
 }
 
 /// Sleeps until the poll's deadline, then closes it, retrying every 5 minutes on failure.
@@ -388,7 +390,10 @@ async fn finish_close(http: &Http, polls: &Collection<Poll>, poll: &Poll) -> Box
     let edit = EditMessage::new()
         .content(poll.text(Some(role)))
         .components(buttons(&poll.answers, true));
-    channel.edit_message(http, message, edit).await?;
+    {
+        let _edits = POLL_EDITS.lock().await;
+        channel.edit_message(http, message, edit).await?;
+    }
 
     let announce = CreateMessage::new()
         .content(format!(
@@ -411,6 +416,7 @@ struct Handler {
 
 impl Handler {
     async fn start_poll(&self, ctx: &Context, form: &ModalInteraction) -> BoxResult<()> {
+        // TODO: maybe only all this command for people who can manage roles?
         let refuse = |text: String| {
             let msg = message(text).ephemeral(true);
             form.create_response(&ctx.http, CreateInteractionResponse::Message(msg))
@@ -545,6 +551,17 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
+    async fn redraw_results(&self, ctx: &Context, c: &ComponentInteraction) -> BoxResult<()> {
+        let _edits = POLL_EDITS.lock().await;
+        let open = doc! { "_id": c.message.id.get() as i64, "closing": { "$ne": true } };
+        let Some(poll) = self.polls.find_one(open).await? else {
+            return Ok(());
+        };
+        let edit = EditInteractionResponse::new().content(poll.text(None));
+        c.edit_response(&ctx.http, edit).await?;
+        Ok(())
+    }
+
     async fn on_vote(&self, ctx: &Context, c: &ComponentInteraction, answer: i32) -> BoxResult<()> {
         let result = vote(
             &self.polls,
@@ -556,14 +573,14 @@ impl Handler {
         let private =
             |text: &str| CreateInteractionResponse::Message(message(text).ephemeral(true));
         match result {
-            Ok(Some((poll, reply))) => {
-                let update = CreateInteractionResponseMessage::new().content(poll.text(None));
-                c.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(update))
+            Ok(Some(reply)) => {
+                c.create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
                     .await?;
                 let followup = CreateInteractionResponseFollowup::new()
                     .content(reply)
                     .ephemeral(true);
                 c.create_followup(&ctx.http, followup).await?;
+                self.redraw_results(ctx, c).await?;
             }
             Ok(None) => {
                 c.create_response(&ctx.http, private("This poll is closed."))
