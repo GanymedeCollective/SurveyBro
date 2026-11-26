@@ -27,6 +27,7 @@ struct Poll {
     /// user id -> index into `answers`
     votes: HashMap<String, i32>,
     creator: i64,
+    role_id: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -261,7 +262,7 @@ async fn vote(
 ) -> mongodb::error::Result<Option<(Poll, String)>> {
     let before = polls
         .find_one_and_update(
-            doc! { "_id": message },
+            doc! { "_id": message, "closing": { "$ne": true } },
             doc! { "$set": { format!("votes.{user}"): answer } },
         )
         .await?;
@@ -281,27 +282,61 @@ async fn vote(
     Ok(Some((poll, reply)))
 }
 
-/// Sleeps until the poll's deadline, then closes it.
+/// Sleeps until the poll's deadline, then closes it, retrying every 5 minutes on failure.
 fn schedule_close(http: Arc<Http>, polls: Collection<Poll>, id: i64, closes_at: i64) {
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(
-            closes_at.saturating_sub(now()).max(0) as u64
-        ))
-        .await;
-        if let Err(e) = close_poll(&http, &polls, id).await {
-            eprintln!("closing poll {id} failed: {e}");
+        let mut wait = closes_at.saturating_sub(now()).max(0) as u64;
+        loop {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            match close_poll(&http, &polls, id).await {
+                Ok(()) => return,
+                Err(e) => eprintln!("closing poll {id} failed, retrying in 5 min: {e}"),
+            }
+            wait = 300;
         }
     });
 }
 
+async fn claim(polls: &Collection<Poll>, id: i64) -> mongodb::error::Result<Option<Poll>> {
+    polls
+        .find_one_and_update(
+            doc! { "_id": id, "closing": { "$ne": true } },
+            doc! { "$set": { "closing": true } },
+        )
+        .await
+}
+
 async fn close_poll(http: &Http, polls: &Collection<Poll>, id: i64) -> BoxResult<()> {
-    let Some(poll) = polls.find_one_and_delete(doc! { "_id": id }).await? else {
+    let Some(poll) = claim(polls, id).await? else {
         return Ok(());
     };
+    let result = finish_close(http, polls, &poll).await;
+    if result.is_err() {
+        polls
+            .update_one(doc! { "_id": id }, doc! { "$set": { "closing": false } })
+            .await?;
+    }
+    result
+}
+
+async fn finish_close(http: &Http, polls: &Collection<Poll>, poll: &Poll) -> BoxResult<()> {
+    let id = poll.message;
     let guild = GuildId::new(poll.guild as u64);
-    let role = guild
-        .create_role(http, EditRole::new().name(&poll.role))
-        .await?;
+    let role = match poll.role_id {
+        Some(r) => RoleId::new(r as u64),
+        None => {
+            let role = guild
+                .create_role(http, EditRole::new().name(&poll.role))
+                .await?;
+            polls
+                .update_one(
+                    doc! { "_id": id },
+                    doc! { "$set": { "role_id": role.id.get() as i64 } },
+                )
+                .await?;
+            role.id
+        }
+    };
     let mut given = 0;
     for (user, &answer) in &poll.votes {
         if !poll.answers.get(answer as usize).is_some_and(|a| a.yes) {
@@ -312,7 +347,7 @@ async fn close_poll(http: &Http, polls: &Collection<Poll>, id: i64) -> BoxResult
         };
         given += 1;
         if let Err(e) = http
-            .add_member_role(guild, UserId::new(user), role.id, Some("survey-bro poll"))
+            .add_member_role(guild, UserId::new(user), role, Some("survey-bro poll"))
             .await
         {
             eprintln!("could not give role to {user}: {e}");
@@ -322,7 +357,7 @@ async fn close_poll(http: &Http, polls: &Collection<Poll>, id: i64) -> BoxResult
     let channel = ChannelId::new(poll.channel as u64);
     let message = MessageId::new(id as u64);
     let edit = EditMessage::new()
-        .content(poll.text(Some(role.id)))
+        .content(poll.text(Some(role)))
         .components(buttons(&poll.answers, true));
     channel.edit_message(http, message, edit).await?;
 
@@ -336,6 +371,8 @@ async fn close_poll(http: &Http, polls: &Collection<Poll>, id: i64) -> BoxResult
         .reference_message((channel, message))
         .allowed_mentions(CreateAllowedMentions::new());
     channel.send_message(http, announce).await?;
+
+    polls.delete_one(doc! { "_id": id }).await?;
     Ok(())
 }
 
@@ -372,6 +409,7 @@ impl Handler {
             answers,
             votes: HashMap::new(),
             creator: form.user.id.get() as i64,
+            role_id: None,
         };
         let post = message(poll.text(None)).components(buttons(&poll.answers, false));
         form.create_response(&ctx.http, CreateInteractionResponse::Message(post))
@@ -419,7 +457,16 @@ impl EventHandler for Handler {
             Err(e) => eprintln!("failed to register /poll: {e}"),
         }
 
-        // Resume polls that were open when the bot last stopped.
+        if let Err(e) = self
+            .polls
+            .update_many(
+                doc! { "closing": true },
+                doc! { "$set": { "closing": false } },
+            )
+            .await
+        {
+            eprintln!("could not release interrupted closes: {e}");
+        }
         let mut cursor = match self.polls.find(doc! {}).await {
             Ok(c) => c,
             Err(e) => return eprintln!("could not load open polls: {e}"),
@@ -525,7 +572,16 @@ impl Handler {
             Some(_) => {
                 c.create_response(&ctx.http, update("Closing the poll..."))
                     .await?;
-                close_poll(&ctx.http, &self.polls, id).await?;
+                if let Err(e) = close_poll(&ctx.http, &self.polls, id).await {
+                    let retry = CreateButton::new(format!("close:{id}"))
+                        .label("Close poll now")
+                        .style(ButtonStyle::Danger);
+                    let edit = EditInteractionResponse::new()
+                        .content("Couldn't close the poll, try again in a moment.")
+                        .components(vec![CreateActionRow::Buttons(vec![retry])]);
+                    c.edit_response(&ctx.http, edit).await?;
+                    return Err(e);
+                }
                 c.edit_response(
                     &ctx.http,
                     EditInteractionResponse::new().content("Poll closed."),
@@ -555,7 +611,15 @@ async fn main() {
         .event_handler(Handler { polls })
         .await
         .expect("failed to build client");
-    client.start().await.expect("client crashed");
+
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    println!("connecting to Discord...");
+    tokio::select! {
+        result = client.start() => result.expect("client crashed"),
+        _ = sigterm.recv() => println!("got SIGTERM, shutting down"),
+        _ = tokio::signal::ctrl_c() => println!("got Ctrl+C, shutting down"),
+    }
 }
 
 #[cfg(test)]

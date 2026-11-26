@@ -9,4 +9,4 @@ humantime = "2"
 mongodb = "3"
 serde = { version = "1", features = ["derive"] }
 serenity = "0.12"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
