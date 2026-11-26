@@ -34,7 +34,7 @@ struct Poll {
     role_id: Option<i64>,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize)]
 struct Answer {
     label: String,
     yes: bool,
@@ -473,84 +473,7 @@ impl Handler {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl EventHandler for Handler {
-    async fn ready(&self, ctx: Context, ready: Ready) {
-        let cmd = CreateCommand::new("poll").description(
-            "Create a poll; people who pick certain answers get a role when it closes",
-        );
-        match Command::create_global_command(&ctx.http, cmd).await {
-            Ok(_) => println!("{} ready, /poll registered", ready.user.name),
-            Err(e) => eprintln!("failed to register /poll: {e}"),
-        }
-
-        if let Err(e) = self
-            .polls
-            .update_many(
-                doc! { "closing": true },
-                doc! { "$set": { "closing": false } },
-            )
-            .await
-        {
-            eprintln!("could not release interrupted closes: {e}");
-        }
-        let mut cursor = match self.polls.find(doc! {}).await {
-            Ok(c) => c,
-            Err(e) => return eprintln!("could not load open polls: {e}"),
-        };
-        while let Ok(true) = cursor.advance().await {
-            match cursor.deserialize_current() {
-                Ok(p) => {
-                    schedule_close(ctx.http.clone(), self.polls.clone(), p.message, p.closes_at)
-                }
-                Err(e) => eprintln!("skipping unreadable poll: {e}"),
-            }
-        }
-    }
-
-    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        match interaction {
-            Interaction::Command(cmd) if cmd.data.name == "poll" => {
-                let response = if cmd.guild_id.is_some() {
-                    CreateInteractionResponse::Modal(poll_form())
-                } else {
-                    CreateInteractionResponse::Message(
-                        message("Polls only work in a server.").ephemeral(true),
-                    )
-                };
-                if let Err(e) = cmd.create_response(&ctx.http, response).await {
-                    eprintln!("could not open poll form: {e}");
-                }
-            }
-            Interaction::Modal(form) if form.data.custom_id == "poll_form" => {
-                if let Err(e) = self.start_poll(&ctx, &form).await {
-                    eprintln!("poll failed: {e}");
-                }
-            }
-            Interaction::Component(c) if c.data.custom_id.starts_with("answer:") => {
-                let Ok(answer) = c.data.custom_id["answer:".len()..].parse() else {
-                    return;
-                };
-                if let Err(e) = self.on_vote(&ctx, &c, answer).await {
-                    eprintln!("vote failed: {e}");
-                }
-            }
-            Interaction::Component(c) if c.data.custom_id.starts_with("close:") => {
-                let Ok(id) = c.data.custom_id["close:".len()..].parse::<i64>() else {
-                    return;
-                };
-                if let Err(e) = self.close_early(&ctx, &c, id).await {
-                    eprintln!("closing poll {id} early failed: {e}");
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-impl Handler {
     async fn redraw_results(&self, ctx: &Context, c: &ComponentInteraction) -> BoxResult<()> {
         let _edits = POLL_EDITS.lock().await;
         let open = doc! { "_id": c.message.id.get() as i64, "closing": { "$ne": true } };
@@ -632,6 +555,81 @@ impl Handler {
         };
         c.create_response(&ctx.http, update(text)).await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl EventHandler for Handler {
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        let cmd = CreateCommand::new("poll").description(
+            "Create a poll; people who pick certain answers get a role when it closes",
+        );
+        match Command::create_global_command(&ctx.http, cmd).await {
+            Ok(_) => println!("{} ready, /poll registered", ready.user.name),
+            Err(e) => eprintln!("failed to register /poll: {e}"),
+        }
+
+        if let Err(e) = self
+            .polls
+            .update_many(
+                doc! { "closing": true },
+                doc! { "$set": { "closing": false } },
+            )
+            .await
+        {
+            eprintln!("could not release interrupted closes: {e}");
+        }
+        let mut cursor = match self.polls.find(doc! {}).await {
+            Ok(c) => c,
+            Err(e) => return eprintln!("could not load open polls: {e}"),
+        };
+        while let Ok(true) = cursor.advance().await {
+            match cursor.deserialize_current() {
+                Ok(p) => {
+                    schedule_close(ctx.http.clone(), self.polls.clone(), p.message, p.closes_at)
+                }
+                Err(e) => eprintln!("skipping unreadable poll: {e}"),
+            }
+        }
+    }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        match interaction {
+            Interaction::Command(cmd) if cmd.data.name == "poll" => {
+                let response = if cmd.guild_id.is_some() {
+                    CreateInteractionResponse::Modal(poll_form())
+                } else {
+                    CreateInteractionResponse::Message(
+                        message("Polls only work in a server.").ephemeral(true),
+                    )
+                };
+                if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                    eprintln!("could not open poll form: {e}");
+                }
+            }
+            Interaction::Modal(form) if form.data.custom_id == "poll_form" => {
+                if let Err(e) = self.start_poll(&ctx, &form).await {
+                    eprintln!("poll failed: {e}");
+                }
+            }
+            Interaction::Component(c) if c.data.custom_id.starts_with("answer:") => {
+                let Ok(answer) = c.data.custom_id["answer:".len()..].parse() else {
+                    return;
+                };
+                if let Err(e) = self.on_vote(&ctx, &c, answer).await {
+                    eprintln!("vote failed: {e}");
+                }
+            }
+            Interaction::Component(c) if c.data.custom_id.starts_with("close:") => {
+                let Ok(id) = c.data.custom_id["close:".len()..].parse::<i64>() else {
+                    return;
+                };
+                if let Err(e) = self.close_early(&ctx, &c, id).await {
+                    eprintln!("closing poll {id} early failed: {e}");
+                }
+            }
+            _ => {}
+        }
     }
 }
 
