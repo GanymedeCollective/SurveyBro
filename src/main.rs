@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use mongodb::Collection;
 use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 use serenity::all::*;
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
 
 type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -134,10 +134,7 @@ fn parse_answers(yes: &str, no: &str) -> std::result::Result<Vec<Answer>, String
 }
 
 fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    Utc::now().timestamp()
 }
 
 /// Parses the form's close field into a unix timestamp. Accepts a French date
@@ -146,9 +143,8 @@ fn parse_close<Tz: TimeZone>(input: &str, now: DateTime<Tz>) -> std::result::Res
     let closes_at = if input.contains('/') {
         parse_date(input, &now)?
     } else {
-        let d = humantime::parse_duration(input).map_err(|e| {
-            format!("Can't read `{input}` ({e}). Try `16/12`, `16/12/2026`, `1d 6h` or `90m`.")
-        })?;
+        let d = humantime::parse_duration(input)
+            .map_err(|e| format!("Can't read `{input}` ({e}). Try `1d 6h` or `90m`."))?;
         now.timestamp()
             .saturating_add(d.as_secs().min(i64::MAX as u64) as i64)
     };
@@ -583,7 +579,17 @@ impl EventHandler for Handler {
             Ok(c) => c,
             Err(e) => return eprintln!("could not load open polls: {e}"),
         };
-        while let Ok(true) = cursor.advance().await {
+        loop {
+            match cursor.advance().await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    eprintln!(
+                        "stopped loading open polls, the rest won't close until restart: {e}"
+                    );
+                    break;
+                }
+            }
             match cursor.deserialize_current() {
                 Ok(p) => {
                     schedule_close(ctx.http.clone(), self.polls.clone(), p.message, p.closes_at)
